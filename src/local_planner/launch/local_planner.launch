@@ -70,7 +70,7 @@
     <param name="sensorOffsetX" value="$(arg sensorOffsetX)" />
     <param name="sensorOffsetY" value="$(arg sensorOffsetY)" />
     <param name="odom_topic" value="$(arg odom_topic)" />
-
+    
     <param name="pubSkipNum" type="int" value="1" />    <!-- 每个cmd_vel的发布次数 -->
     <param name="twoWayDrive" value="$(arg twoWayDrive)" />
     <param name="lookAheadDis" type="double" value="2.5" />   <!-- 前视距离 -->
@@ -110,6 +110,7 @@
     <param name="autonomySpeed" value="$(arg autonomySpeed)" />
     <param name="joyToSpeedDelay" value="$(arg joyToSpeedDelay)" />
     <param name="speedFilterAlpha" type="double" value="0.3" />
+    <param name="turnAroundThreshold" value="5.0"/>  <!-- 完成阈值，单位：度 --
   </node>
 
 </launch>

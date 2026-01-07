@@ -116,6 +116,7 @@ bool turnAroundTriggered = false;  // 是否触发原地掉头
 double turnAroundTargetYaw = 0.0;  // 掉头目标角度
 double turnAroundStartYaw = 0.0;   // 掉头开始时的角度
 bool turnAroundInProgress = false; // 正在执行掉头
+bool turnAroundCompleted = false;  // 掉头完成标志
 double turnAroundThreshold = 5.0 * PI / 180.0; 
 void processTurnAround(ros::Publisher& pubSpeed_1, ros::Publisher& pubSpeed, ros::Publisher& yhs_ctrl_pub, 
                        geometry_msgs::TwistStamped& cmd_vel_1, geometry_msgs::Twist& cmd_vel);
@@ -215,7 +216,8 @@ void stopHandler(const std_msgs::Int8::ConstPtr &stop)
 
 
 void processTurnAround(ros::Publisher& pubSpeed_1, ros::Publisher& pubSpeed, ros::Publisher& yhs_ctrl_pub,
-                       geometry_msgs::TwistStamped& cmd_vel_1, geometry_msgs::Twist& cmd_vel)
+                       geometry_msgs::TwistStamped& cmd_vel_1, geometry_msgs::Twist& cmd_vel,
+                       ros::Publisher& pubTurnAroundStatus)
 {
   // 计算当前角度与目标角度的差值
   float yawDiff = turnAroundTargetYaw - vehicleYaw;
@@ -231,6 +233,7 @@ void processTurnAround(ros::Publisher& pubSpeed_1, ros::Publisher& pubSpeed, ros
   {
     turnAroundInProgress = false;
     turnAroundTriggered = false;
+    turnAroundCompleted = true;
     vehicleSpeed = 0;
     vehicleYawRate = 0;
     
@@ -250,6 +253,10 @@ void processTurnAround(ros::Publisher& pubSpeed_1, ros::Publisher& pubSpeed, ros
 
     pubSpeed_1.publish(cmd_vel_1);
     pubSpeed.publish(cmd_vel);
+
+    std_msgs::Int8 status_msg;
+    status_msg.data = 1;  // 1表示完成
+    pubTurnAroundStatus.publish(status_msg);
     
     ROS_INFO("Turn around completed! Final yaw error: %.2f degrees", fabs(yawDiff) * 180.0 / PI);
     return;
@@ -364,6 +371,7 @@ int main(int argc, char **argv)
   ros::Publisher yhs_ctrl_pub = nh.advertise<yhs_can_msgs::ctrl_cmd>("/ctrl_cmd", 1);
 
   turnAroundThreshold = turnAroundThreshold * PI / 180.0;// 转成弧度
+  ros::Publisher pubTurnAroundStatus = nh.advertise<std_msgs::Int8>("/turn_around_status", 5);
   
   geometry_msgs::TwistStamped cmd_vel_1;
   cmd_vel_1.header.frame_id = "body";
@@ -387,7 +395,7 @@ int main(int argc, char **argv)
     // 处理原地掉头 
     if (turnAroundInProgress)
     {
-      processTurnAround(pubSpeed_1, pubSpeed, yhs_ctrl_pub, cmd_vel_1, cmd_vel);
+      processTurnAround(pubSpeed_1, pubSpeed, yhs_ctrl_pub, cmd_vel_1, cmd_vel, pubTurnAroundStatus);
       status = ros::ok();
       rate.sleep();
       continue;  
