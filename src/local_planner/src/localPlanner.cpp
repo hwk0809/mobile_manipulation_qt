@@ -9,6 +9,7 @@
 #include <message_filters/sync_policies/approximate_time.h>
 
 #include <std_msgs/Bool.h>
+#include <std_msgs/String.h>
 #include <std_msgs/Float32.h>
 #include <nav_msgs/Path.h>
 #include <nav_msgs/Odometry.h>
@@ -85,6 +86,11 @@ double joyToCheckObstacleDelay = 5.0;
 double goalClearRange = 0.5; // 	当 pathCropByGoal = true 时,点云距离超过目标点+该值则不被处理
 double goalX = 0;            //     局部路径目标点
 double goalY = 0;            //     局部路径目标点
+double ignoreObstacleRange = 2.0; // 距离目标点小于该值时忽略避障
+double reachGoalConfirmTime = 0.3; // 连续满足到达条件的时间
+
+// goal label handling
+std::string current_goal_label = "unknown";
 
 double nn_goal_x_in_map = 0.0;
 double nn_goal_y_in_map = 0.0;
@@ -145,6 +151,7 @@ bool reach_goal_flag_g = true;
 // 时间记录:
 double odomTime = 0; // 记录最近一次接收到的里程计数据的时间戳。
 double joyTime = 0;  // 记录最近一次接收到的手柄数据的时间戳。
+double reach_goal_start_time = 0.0; // 连续到达判定起始时间
 
 // 车辆状态:
 float vehicleRoll = 0, vehiclePitch = 0, vehicleYaw = 0; // 恒为0
@@ -228,6 +235,21 @@ void goalHandler(const geometry_msgs::PoseStamped::ConstPtr &goal)  //仅处理�
   goalY = goal->pose.position.y;
   nn_goal_x_in_map = goalX;
   nn_goal_y_in_map = goalY;
+  reach_goal_flag_g = false;
+  reach_goal_start_time = 0.0;
+
+  // parse label from frame_id (format: map:start or map:end)
+  std::string frame_id = goal->header.frame_id;
+  size_t pos = frame_id.find(':');
+  if (pos != std::string::npos && pos + 1 < frame_id.size())
+  {
+    current_goal_label = frame_id.substr(pos + 1);
+  }
+  else
+  {
+    // if no delimiter, store the full frame_id as label (could be "map", "unknown" etc.)
+    current_goal_label = frame_id.empty() ? "unknown" : frame_id;
+  }
   // float dx = goalX - vehicleX_1;
   // float dy = goalY - vehicleY_1;
   // goalX = dx* cos(vehicleYaw_1) + dy*sin(vehicleYaw_1);
@@ -519,6 +541,8 @@ int main(int argc, char **argv)
   nhPrivate.getParam("joyToSpeedDelay", joyToSpeedDelay);                 // 从接收遥控器指令到机器人或车辆调整其速度的时间延迟
   nhPrivate.getParam("joyToCheckObstacleDelay", joyToCheckObstacleDelay); // 遥控器发出指令和系统开始检测障碍物之间的时间延迟（导航手动切换）。这有助于管理遥控器输入与自动障碍物检测系统之间的交互
   nhPrivate.getParam("goalClearRange", goalClearRange);                   // 当 pathCropByGoal = true 时,点云距离超过目标点+该值则不被处理
+  nhPrivate.getParam("ignoreObstacleRange", ignoreObstacleRange);         // 近目标距离内忽略避障
+  nhPrivate.getParam("reachGoalConfirmTime", reachGoalConfirmTime);       // 连续满足到达条件的时间
   nhPrivate.getParam("goalX", goalX);                                     // 局部路径目标点x(0) map 
   nhPrivate.getParam("goalY", goalY);                                     // 局部路径目标点y(0)
 
@@ -544,6 +568,8 @@ int main(int argc, char **argv)
   bool hasLastPath = false;
   int lastSelectedGroupID = -1;
   double lastSelectedScore = 0.0;
+  ros::Publisher pubGoalReached = nh.advertise<std_msgs::Bool>("/goal_reached", 1, true);
+  ros::Publisher pubGoalReachedLabel = nh.advertise<std_msgs::String>("/goal_reached_label", 1, true);
 
 #if PLOTPATHSET == 1
   ros::Publisher pubFreePaths = nh.advertise<sensor_msgs::PointCloud2>("/free_paths", 2); // 发布可视化的freepath路径
@@ -649,6 +675,8 @@ int main(int argc, char **argv)
       if (pathRange < minPathRange)
         pathRange = minPathRange;
       float relativeGoalDis = adjacentRange; // 将点云探索的边界值赋予相对的目标距离
+      bool checkObstacleNow = checkObstacle;
+      bool checkRotObstacleNow = checkRotObstacle;
 
       // 自动模式下，计算目标点（map）在base_link下的坐标，并计算和限制车辆到目标点的转角
       if (autonomyMode)
@@ -681,19 +709,40 @@ int main(int argc, char **argv)
         ROS_WARN_STREAM("relativeGoalDis: "<< relativeGoalDis);
         ROS_WARN_STREAM("joydir: "<< joyDir);
         if(relativeGoalDis<reach_goal_thre_g)
+      {
+          double now = ros::Time::now().toSec();
+          if (reach_goal_start_time == 0.0)
+          {
+            reach_goal_start_time = now;
+          }
+          if (now - reach_goal_start_time >= reachGoalConfirmTime)
+          {
+            reach_goal_flag_g = true;
+            reach_goal_start_time = 0.0;
+            ROS_WARN("reach goal !!!");
+            nav_msgs::Path stopPath;
+            stopPath.poses.resize(1);
+            stopPath.poses[0].pose.position.x = 0;
+            stopPath.poses[0].pose.position.y = 0;
+            stopPath.poses[0].pose.position.z = 0;
+            stopPath.header.stamp = ros::Time().fromSec(odomTime);
+            stopPath.header.frame_id = "body";
+            pubPath.publish(stopPath);
+
+            std_msgs::Bool reachMsg;
+            reachMsg.data = true;
+            pubGoalReached.publish(reachMsg);
+            std_msgs::String labelMsg;
+            labelMsg.data = current_goal_label;
+            pubGoalReachedLabel.publish(labelMsg);
+
+            hasLastPath = false;
+            continue;
+          }
+      }
+        else
         {
-          reach_goal_flag_g = true;
-          ROS_WARN("reach goal !!!");
-          nav_msgs::Path stopPath;
-          stopPath.poses.resize(1);
-          stopPath.poses[0].pose.position.x = 0;
-          stopPath.poses[0].pose.position.y = 0;
-          stopPath.poses[0].pose.position.z = 0;
-          stopPath.header.stamp = ros::Time().fromSec(odomTime);
-          stopPath.header.frame_id = "body";
-          pubPath.publish(stopPath);
-          hasLastPath = false;
-          continue;
+          reach_goal_start_time = 0.0;
         }
 
         if (!twoWayDrive)
@@ -702,6 +751,20 @@ int main(int argc, char **argv)
             joyDir = 90.0;
           else if (joyDir < -90.0)
             joyDir = -90.0;
+        }
+
+        if (relativeGoalDis < ignoreObstacleRange)
+        {
+          checkObstacleNow = false;
+          checkRotObstacleNow = false;
+        }
+      }
+      else
+      {
+        if (relativeGoalDis < ignoreObstacleRange)
+        {
+          checkObstacleNow = false;
+          checkRotObstacleNow = false;
         }
       }
 
@@ -740,7 +803,7 @@ int main(int argc, char **argv)
 
           // 判断点云中的某个点是否应该被考虑在路径规划中，如果符合条件则继续处理
           // 判断条件：1.小于路径宽度（点云在车辆检测范围内）2.待检测点到车辆距离dis小于车到目标点距离（离目标太远无意义） 3.启动障碍物检测的点
-          if (dis < pathRange / pathScale && (dis <= (relativeGoalDis + goalClearRange) / pathScale || !pathCropByGoal) && checkObstacle)
+          if (dis < pathRange / pathScale && (dis <= (relativeGoalDis + goalClearRange) / pathScale || !pathCropByGoal) && checkObstacleNow)
           {
             for (int rotDir = 0; rotDir < 36; rotDir++)
             {                                                         // 36个方向
@@ -801,8 +864,8 @@ int main(int argc, char **argv)
                 // 并且h超过了障碍物阈值（障碍物）（if的前三个条件）
           if (dis < diameter / pathScale && 
               (fabs(x) > vehicleLength / pathScale / 2.0 || fabs(y) > vehicleWidth / pathScale / 2.0) &&
-                (h > obstacleHeightThre || !useTerrainAnalysis) 
-                && checkRotObstacle)
+              (h > obstacleHeightThre || !useTerrainAnalysis) 
+                && checkRotObstacleNow)
           {
             float angObs = atan2(y, x) * 180.0 / PI; // 点云的方向
             if (angObs > 0)

@@ -13,6 +13,7 @@
 #include <nav_msgs/Path.h>
 #include <nav_msgs/Odometry.h>
 #include <geometry_msgs/TwistStamped.h>
+#include <geometry_msgs/PoseStamped.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <sensor_msgs/Joy.h>
@@ -74,6 +75,15 @@ double autonomySpeed = 1.0;
 double joyToSpeedDelay = 2.0;
 double speedFilterAlpha = 0.3;
 
+// return-to-start goal after turn-around
+const double return_goal_x = -9.685347557067871;
+const double return_goal_y = 5.662903785705566;
+const double return_goal_z = 0.0;
+const double return_goal_qx = 0.0;
+const double return_goal_qy = 0.0;
+const double return_goal_qz = 0.9795326031700423;
+const double return_goal_qw = 0.20128556661350672;
+
 float joySpeed = 0;
 float joySpeedRaw = 0;
 float joyYaw = 0;
@@ -119,7 +129,8 @@ bool turnAroundInProgress = false; // 正在执行掉头
 bool turnAroundCompleted = false;  // 掉头完成标志
 double turnAroundThreshold = 5.0 * PI / 180.0; 
 void processTurnAround(ros::Publisher& pubSpeed_1, ros::Publisher& pubSpeed, ros::Publisher& yhs_ctrl_pub, 
-                       geometry_msgs::TwistStamped& cmd_vel_1, geometry_msgs::Twist& cmd_vel);
+                       geometry_msgs::TwistStamped& cmd_vel_1, geometry_msgs::Twist& cmd_vel,
+                       ros::Publisher& pubTurnAroundStatus, ros::Publisher& pubGoalReturn);
 
 
 nav_msgs::Path path;
@@ -217,7 +228,7 @@ void stopHandler(const std_msgs::Int8::ConstPtr &stop)
 
 void processTurnAround(ros::Publisher& pubSpeed_1, ros::Publisher& pubSpeed, ros::Publisher& yhs_ctrl_pub,
                        geometry_msgs::TwistStamped& cmd_vel_1, geometry_msgs::Twist& cmd_vel,
-                       ros::Publisher& pubTurnAroundStatus)
+                       ros::Publisher& pubTurnAroundStatus, ros::Publisher& pubGoalReturn)
 {
   // 计算当前角度与目标角度的差值
   float yawDiff = turnAroundTargetYaw - vehicleYaw;
@@ -257,6 +268,18 @@ void processTurnAround(ros::Publisher& pubSpeed_1, ros::Publisher& pubSpeed, ros
     std_msgs::Int8 status_msg;
     status_msg.data = 1;  // 1表示完成
     pubTurnAroundStatus.publish(status_msg);
+
+    geometry_msgs::PoseStamped goalMsg;
+    goalMsg.header.stamp = ros::Time::now();
+    goalMsg.header.frame_id = "map:start";
+    goalMsg.pose.position.x = return_goal_x;
+    goalMsg.pose.position.y = return_goal_y;
+    goalMsg.pose.position.z = return_goal_z;
+    goalMsg.pose.orientation.x = return_goal_qx;
+    goalMsg.pose.orientation.y = return_goal_qy;
+    goalMsg.pose.orientation.z = return_goal_qz;
+    goalMsg.pose.orientation.w = return_goal_qw;
+    pubGoalReturn.publish(goalMsg);
     
     ROS_INFO("Turn around completed! Final yaw error: %.2f degrees", fabs(yawDiff) * 180.0 / PI);
     return;
@@ -369,6 +392,7 @@ int main(int argc, char **argv)
   ros::Publisher pubSpeed = nh.advertise<geometry_msgs::Twist>("/cmd_vel", 5);
   geometry_msgs::Twist cmd_vel;
   ros::Publisher yhs_ctrl_pub = nh.advertise<yhs_can_msgs::ctrl_cmd>("/ctrl_cmd", 1);
+  ros::Publisher pubGoalReturn = nh.advertise<geometry_msgs::PoseStamped>("/move_base_simple/goal", 1, true);
 
   turnAroundThreshold = turnAroundThreshold * PI / 180.0;// 转成弧度
   ros::Publisher pubTurnAroundStatus = nh.advertise<std_msgs::Int8>("/turn_around_status", 5);
@@ -395,7 +419,7 @@ int main(int argc, char **argv)
     // 处理原地掉头 
     if (turnAroundInProgress)
     {
-      processTurnAround(pubSpeed_1, pubSpeed, yhs_ctrl_pub, cmd_vel_1, cmd_vel, pubTurnAroundStatus);
+      processTurnAround(pubSpeed_1, pubSpeed, yhs_ctrl_pub, cmd_vel_1, cmd_vel, pubTurnAroundStatus, pubGoalReturn);
       status = ros::ok();
       rate.sleep();
       continue;  
