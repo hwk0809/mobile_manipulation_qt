@@ -110,6 +110,17 @@ bool headingAligned = false;
 double lastTargetSpeed = 0.0;
 double lastPublishedLinear = 0.0;
 
+
+// 掉头相关
+bool turnAroundTriggered = false;  // 是否触发原地掉头
+double turnAroundTargetYaw = 0.0;  // 掉头目标角度
+double turnAroundStartYaw = 0.0;   // 掉头开始时的角度
+bool turnAroundInProgress = false; // 正在执行掉头
+double turnAroundThreshold = 5.0 * PI / 180.0; 
+void processTurnAround(ros::Publisher& pubSpeed_1, ros::Publisher& pubSpeed, ros::Publisher& yhs_ctrl_pub, 
+                       geometry_msgs::TwistStamped& cmd_vel_1, geometry_msgs::Twist& cmd_vel);
+
+
 nav_msgs::Path path;
 
 void odomHandler(const nav_msgs::Odometry::ConstPtr &odomIn)
@@ -137,6 +148,27 @@ void odomHandler(const nav_msgs::Odometry::ConstPtr &odomIn)
     slowInitTime = odomIn->header.stamp.toSec();
   }
 }
+
+void turnAroundHandler(const std_msgs::Int8::ConstPtr &trigger)
+{
+  if (trigger->data == 1 && !turnAroundInProgress)
+  {
+    turnAroundTriggered = true;
+    turnAroundStartYaw = vehicleYaw;
+    // 计算目标角度(当前角度+180度)
+    turnAroundTargetYaw = vehicleYaw + PI;
+    // 归一化到[-π, π]
+    if (turnAroundTargetYaw > PI)
+      turnAroundTargetYaw -= 2 * PI;
+    else if (turnAroundTargetYaw < -PI)
+      turnAroundTargetYaw += 2 * PI;
+    
+    turnAroundInProgress = true;
+    ROS_INFO("Turn around triggered: current yaw = %.2f, target yaw = %.2f", 
+             vehicleYaw * 180.0 / PI, turnAroundTargetYaw * 180.0 / PI);
+  }
+}
+
 
 void pathHandler(const nav_msgs::Path::ConstPtr &pathIn)
 {
@@ -179,6 +211,89 @@ void speedHandler(const std_msgs::Float32::ConstPtr &speed)
 void stopHandler(const std_msgs::Int8::ConstPtr &stop)
 {
   safetyStop = stop->data;
+}
+
+
+void processTurnAround(ros::Publisher& pubSpeed_1, ros::Publisher& pubSpeed, ros::Publisher& yhs_ctrl_pub,
+                       geometry_msgs::TwistStamped& cmd_vel_1, geometry_msgs::Twist& cmd_vel)
+{
+  // 计算当前角度与目标角度的差值
+  float yawDiff = turnAroundTargetYaw - vehicleYaw;
+  
+  // 归一化角度差到[-π, π]
+  if (yawDiff > PI)
+    yawDiff -= 2 * PI;
+  else if (yawDiff < -PI)
+    yawDiff += 2 * PI;
+
+  // 判断是否完成掉头
+  if (fabs(yawDiff) < turnAroundThreshold)
+  {
+    turnAroundInProgress = false;
+    turnAroundTriggered = false;
+    vehicleSpeed = 0;
+    vehicleYawRate = 0;
+    
+    // 发布停止指令
+    cmd_vel_1.header.stamp = ros::Time().fromSec(odomTime);
+    cmd_vel_1.twist.linear.x = 0;
+    cmd_vel_1.twist.angular.z = 0;
+
+    cmd_vel.linear.x = 0;
+    cmd_vel.angular.z = 0;
+
+    yhs_can_msgs::ctrl_cmd yhs_cmd_vel;
+    yhs_cmd_vel.ctrl_cmd_gear = 6;
+    yhs_cmd_vel.ctrl_cmd_x_linear = 0;
+    yhs_cmd_vel.ctrl_cmd_z_angular = 0;
+    yhs_ctrl_pub.publish(yhs_cmd_vel);
+
+    pubSpeed_1.publish(cmd_vel_1);
+    pubSpeed.publish(cmd_vel);
+    
+    ROS_INFO("Turn around completed! Final yaw error: %.2f degrees", fabs(yawDiff) * 180.0 / PI);
+    return;
+  }
+
+  // 执行原地旋转
+  vehicleSpeed = 0;  // 线速度为0
+  
+  // 根据角度差计算角速度
+  double turnYawRate = stopYawRateGain * yawDiff;
+  
+  // 限制角速度
+  if (turnYawRate > maxYawRate * PI / 180.0)
+    turnYawRate = maxYawRate * PI / 180.0;
+  else if (turnYawRate < -maxYawRate * PI / 180.0)
+    turnYawRate = -maxYawRate * PI / 180.0;
+  
+  vehicleYawRate = turnYawRate;
+
+  // 发布速度指令
+  pubSkipCount--;
+  if (pubSkipCount < 0)
+  {
+    cmd_vel_1.header.stamp = ros::Time().fromSec(odomTime);
+    cmd_vel_1.twist.linear.x = 0;
+    cmd_vel_1.twist.angular.z = vehicleYawRate;
+
+    cmd_vel.linear.x = 0;
+    cmd_vel.angular.z = vehicleYawRate;
+
+    yhs_can_msgs::ctrl_cmd yhs_cmd_vel;
+    yhs_cmd_vel.ctrl_cmd_gear = 6;
+    yhs_cmd_vel.ctrl_cmd_x_linear = 0;
+    yhs_cmd_vel.ctrl_cmd_z_angular = vehicleYawRate * 57.29f;
+    yhs_ctrl_pub.publish(yhs_cmd_vel);
+
+    pubSpeed_1.publish(cmd_vel_1);
+    pubSpeed.publish(cmd_vel);
+
+    pubSkipCount = pubSkipNum;
+    
+    ROS_INFO_THROTTLE(1.0, "Turning... current: %.2f, target: %.2f, diff: %.2f degrees", 
+                      vehicleYaw * 180.0 / PI, turnAroundTargetYaw * 180.0 / PI, yawDiff * 180.0 / PI);
+  }
 }
 
 int main(int argc, char **argv)
@@ -229,6 +344,9 @@ int main(int argc, char **argv)
   nhPrivate.getParam("joyToSpeedDelay", joyToSpeedDelay);
   nhPrivate.getParam("speedFilterAlpha", speedFilterAlpha);
   nhPrivate.getParam("odom_topic", ODOM_TOPIC);  //状态估计话题
+  nhPrivate.getParam("turnAroundThreshold", turnAroundThreshold);// 原地掉头话题， 角度单位
+  
+  
 
   ros::Subscriber subOdom = nh.subscribe<nav_msgs::Odometry>(ODOM_TOPIC, 5, odomHandler);
 
@@ -238,11 +356,14 @@ int main(int argc, char **argv)
 
   ros::Subscriber subStop = nh.subscribe<std_msgs::Int8>("/stop", 5, stopHandler);
 
+  ros::Subscriber subTurnAround = nh.subscribe<std_msgs::Int8>("/turn_around", 5, turnAroundHandler);
+
   ros::Publisher pubSpeed_1 = nh.advertise<geometry_msgs::TwistStamped>("/cmd_vel_1", 5);
   ros::Publisher pubSpeed = nh.advertise<geometry_msgs::Twist>("/cmd_vel", 5);
   geometry_msgs::Twist cmd_vel;
   ros::Publisher yhs_ctrl_pub = nh.advertise<yhs_can_msgs::ctrl_cmd>("/ctrl_cmd", 1);
 
+  turnAroundThreshold = turnAroundThreshold * PI / 180.0;// 转成弧度
   
   geometry_msgs::TwistStamped cmd_vel_1;
   cmd_vel_1.header.frame_id = "body";
@@ -262,6 +383,15 @@ int main(int argc, char **argv)
   while (status)
   {
     ros::spinOnce();
+
+    // 处理原地掉头 
+    if (turnAroundInProgress)
+    {
+      processTurnAround(pubSpeed_1, pubSpeed, yhs_ctrl_pub, cmd_vel_1, cmd_vel);
+      status = ros::ok();
+      rate.sleep();
+      continue;  
+    }
 
     if (pathInit)
     {
