@@ -1,0 +1,41 @@
+
+
+path:
+  use_pimage_map: false
+  map_name: default_map
+  # pcd_relevant_path: "/../../../ws_lio/lio/src/LIO/PCD/20250909-135830_scans.pcd"
+  pcd_relevant_path: "/PCD/map.pcd"
+
+  
+planner:
+  r_expan: 0.3
+  r_expan_local: 0.3
+  car_size_x: [-0.3, 0.3]
+  car_size_y: [-0.3, 0.3]
+  time_max: 500
+
+local_map:
+  extrinsic_T: [ -0.3, 0.0, 0.0 ] # lidar_t_car
+  extrinsic_R:  # 删除多余的文字
+    # - [0.9218, 0.0, -0.3877]
+    # - [0.0, 1.0, 0.0]
+    # - [0.3877, 0.0, 0.9218]
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+    - [0.0, 0.0, 1.0]
+  queue_size: 10
+  x_span: [0.3, 4.0]
+  y_span: [0.3, 4.0]
+
+update_map:
+  update_k: 0.2
+  angle_range: [-180, 180]
+
+filter:
+  z_lim: [-0.2, 1.0]
+  MeanK: 15
+  StddevMulThresh: 0.6
+
+path_smooth:
+  smooth_k: 0.5
+  smooth_n: 4

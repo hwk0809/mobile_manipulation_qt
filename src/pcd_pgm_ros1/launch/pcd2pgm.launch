@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- PCD2PGM Node -->
+  <node name="pcd2pgm_node" pkg="pcd_pgm_ros1" type="pcd2pgm_node" output="screen">
+    <!-- Load parameters from config file -->
+    <rosparam file="$(find pcd_pgm_ros1)/config/config.yaml" command="load" />
+    
+    <!-- Node specific parameters -->
+    <param name="pcd_file_path" value="./PCD/map.pcd" />
+    <param name="cell_resolution" value="0.05" />
+    <param name="map_width" value="100.0" />
+    <param name="map_height" value="100.0" />
+  </node>
+
+  <!-- Optional: RViz for visualization -->
+  <node name="rviz" pkg="rviz" type="rviz" args="-d $(find pcd_pgm_ros1)/config/1.rviz" output="screen" required="false" />
+
+</launch>
