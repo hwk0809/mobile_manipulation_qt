@@ -5,6 +5,7 @@
 #include <geometry_msgs/PoseStamped.h>
 #include <yhs_can_msgs/ctrl_cmd.h>
 #include <visualization_msgs/Marker.h>
+#include <std_msgs/Int8.h>
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
 #include <string>
@@ -17,7 +18,9 @@ class KeyCmdFollower
 {
 public:
     KeyCmdFollower() : nh_("~"), path_received_(false), odom_received_(false), reached_goal_(false), goal_yaw_(0.0), current_yaw_(0.0), 
-                      real_velocity_(0.0), real_steering_(0.0)
+                      real_velocity_(0.0), real_steering_(0.0),
+                      turnAroundTriggered_(false), turnAroundInProgress_(false), turnAroundCompleted_(false),
+                      turnAroundTargetYaw_(0.0), turnAroundStartYaw_(0.0)
     {
         // Parameters
         std::string odom_topic;
@@ -26,16 +29,34 @@ public:
         nh_.param<std::string>("path_topic", path_topic, "/local_path");
         nh_.param<double>("lookahead_dist_index", lookahead_index_offset_, 10.0);
         nh_.param<double>("cmd_speed", cmd_speed_, 0.3);
-        nh_.param<bool>("use_local_path_logic", use_local_path_logic_, true); // New Switch!
+        nh_.param<bool>("use_local_path_logic", use_local_path_logic_, true);
+        nh_.param<double>("turnAroundThreshold", turnAroundThreshold_, 5.0);
+        nh_.param<double>("stopYawRateGain", stopYawRateGain_, 7.5);
+        nh_.param<double>("maxYawRate", maxYawRate_, 45.0);
+        
+        // Turn around return goal
+        nh_.param<double>("return_goal_x", return_goal_x_, -9.685347557067871);
+        nh_.param<double>("return_goal_y", return_goal_y_, 5.662903785705566);
+        nh_.param<double>("return_goal_z", return_goal_z_, 0.0);
+        nh_.param<double>("return_goal_qx", return_goal_qx_, 0.0);
+        nh_.param<double>("return_goal_qy", return_goal_qy_, 0.0);
+        nh_.param<double>("return_goal_qz", return_goal_qz_, 0.9795326031700423);
+        nh_.param<double>("return_goal_qw", return_goal_qw_, 0.20128556661350672);
+
+        // Convert threshold to radians
+        turnAroundThreshold_ = turnAroundThreshold_ * M_PI / 180.0;
 
         // Subscribers
         sub_path_ = nh_public_.subscribe(path_topic, 10, &KeyCmdFollower::pathCallback, this);
         sub_odom_ = nh_public_.subscribe(odom_topic, 10, &KeyCmdFollower::odomCallback, this);
         sub_goal_ = nh_public_.subscribe("/move_base_simple/goal", 10, &KeyCmdFollower::goalPoseCallback, this);
+        sub_turn_around_ = nh_public_.subscribe("/turn_around", 5, &KeyCmdFollower::turnAroundHandler, this);
 
         // Publishers
         pub_ctrl_cmd_ = nh_public_.advertise<yhs_can_msgs::ctrl_cmd>("/ctrl_cmd", 1);
         pub_marker_ = nh_public_.advertise<visualization_msgs::Marker>("/calculated_velocity", 10);
+        pub_turn_around_status_ = nh_public_.advertise<std_msgs::Int8>("/turn_around_status", 5);
+        pub_goal_return_ = nh_public_.advertise<geometry_msgs::PoseStamped>("/move_base_simple/goal", 1, true);
 
         current_position_.x = 0;
         current_position_.y = 0;
@@ -47,6 +68,15 @@ public:
         while (ros::ok())
         {
             ros::spinOnce();
+            
+            // Handle turn around with highest priority
+            if (turnAroundInProgress_)
+            {
+                processTurnAround();
+                rate.sleep();
+                continue;
+            }
+            
             if (path_received_ && odom_received_)
             {
                 updateControl();
@@ -66,8 +96,11 @@ private:
     ros::Subscriber sub_path_;
     ros::Subscriber sub_odom_;
     ros::Subscriber sub_goal_;
+    ros::Subscriber sub_turn_around_;
     ros::Publisher pub_ctrl_cmd_;
     ros::Publisher pub_marker_;
+    ros::Publisher pub_turn_around_status_;
+    ros::Publisher pub_goal_return_;
 
     std::vector<Vec2> path_points_;
     Vec2 current_position_;
@@ -84,12 +117,119 @@ private:
 
     double lookahead_index_offset_;
     double cmd_speed_;
-    bool use_local_path_logic_; // Parameter to control logic
+    bool use_local_path_logic_;
+    
+    // Turn around variables
+    bool turnAroundTriggered_;
+    bool turnAroundInProgress_;
+    bool turnAroundCompleted_;
+    double turnAroundTargetYaw_;
+    double turnAroundStartYaw_;
+    double turnAroundThreshold_;
+    double stopYawRateGain_;
+    double maxYawRate_;
+    
+    // Return goal after turn around
+    double return_goal_x_, return_goal_y_, return_goal_z_;
+    double return_goal_qx_, return_goal_qy_, return_goal_qz_, return_goal_qw_;
 
-    // First order inertial filter from TeleopCar
     double InertialElement(double tao, double GiveValue, double Value_last_time)
     {
         return (tao * Value_last_time + GiveValue) / (1 + tao);
+    }
+    
+    void turnAroundHandler(const std_msgs::Int8::ConstPtr& trigger)
+    {
+        if (trigger->data == 1 && !turnAroundInProgress_)
+        {
+            turnAroundTriggered_ = true;
+            turnAroundStartYaw_ = current_yaw_;
+            
+            // Calculate target yaw (current + 180 degrees)
+            turnAroundTargetYaw_ = current_yaw_ + M_PI;
+            
+            // Normalize to [-π, π]
+            if (turnAroundTargetYaw_ > M_PI)
+                turnAroundTargetYaw_ -= 2 * M_PI;
+            else if (turnAroundTargetYaw_ < -M_PI)
+                turnAroundTargetYaw_ += 2 * M_PI;
+            
+            turnAroundInProgress_ = true;
+            ROS_INFO("Turn around triggered: current yaw = %.2f, target yaw = %.2f", 
+                     current_yaw_ * 180.0 / M_PI, turnAroundTargetYaw_ * 180.0 / M_PI);
+        }
+    }
+    
+    void processTurnAround()
+    {
+        // Calculate yaw difference
+        double yawDiff = turnAroundTargetYaw_ - current_yaw_;
+        
+        // Normalize to [-π, π]
+        while (yawDiff > M_PI) yawDiff -= 2 * M_PI;
+        while (yawDiff < -M_PI) yawDiff += 2 * M_PI;
+
+        // Check if turn around is complete
+        if (std::abs(yawDiff) < turnAroundThreshold_)
+        {
+            turnAroundInProgress_ = false;
+            turnAroundTriggered_ = false;
+            turnAroundCompleted_ = true;
+            
+            // Stop the vehicle
+            real_velocity_ = 0.0;
+            real_steering_ = 0.0;
+            
+            yhs_can_msgs::ctrl_cmd ctrl_cmd_msg;
+            ctrl_cmd_msg.ctrl_cmd_gear = 6;
+            ctrl_cmd_msg.ctrl_cmd_x_linear = 0.0;
+            ctrl_cmd_msg.ctrl_cmd_z_angular = 0.0;
+            pub_ctrl_cmd_.publish(ctrl_cmd_msg);
+
+            // Publish completion status
+            std_msgs::Int8 status_msg;
+            status_msg.data = 1;  // 1 = completed
+            pub_turn_around_status_.publish(status_msg);
+
+            // Publish return goal
+            geometry_msgs::PoseStamped goalMsg;
+            goalMsg.header.stamp = ros::Time::now();
+            goalMsg.header.frame_id = "map:start";
+            goalMsg.pose.position.x = return_goal_x_;
+            goalMsg.pose.position.y = return_goal_y_;
+            goalMsg.pose.position.z = return_goal_z_;
+            goalMsg.pose.orientation.x = return_goal_qx_;
+            goalMsg.pose.orientation.y = return_goal_qy_;
+            goalMsg.pose.orientation.z = return_goal_qz_;
+            goalMsg.pose.orientation.w = return_goal_qw_;
+            pub_goal_return_.publish(goalMsg);
+            
+            ROS_INFO("Turn around completed! Final yaw error: %.2f degrees", 
+                     std::abs(yawDiff) * 180.0 / M_PI);
+            return;
+        }
+
+        // Execute in-place rotation
+        // Calculate angular velocity based on yaw difference
+        double turnYawRate = stopYawRateGain_ * yawDiff;
+        
+        // Limit angular velocity
+        double maxYawRateRad = maxYawRate_ * M_PI / 180.0;
+        if (turnYawRate > maxYawRateRad)
+            turnYawRate = maxYawRateRad;
+        else if (turnYawRate < -maxYawRateRad)
+            turnYawRate = -maxYawRateRad;
+
+        // Publish command
+        yhs_can_msgs::ctrl_cmd ctrl_cmd_msg;
+        ctrl_cmd_msg.ctrl_cmd_gear = 6;
+        ctrl_cmd_msg.ctrl_cmd_x_linear = 0.0;  // No linear velocity
+        ctrl_cmd_msg.ctrl_cmd_z_angular = turnYawRate * 180.0 / M_PI;  // Convert to degrees
+        pub_ctrl_cmd_.publish(ctrl_cmd_msg);
+        
+        ROS_INFO_THROTTLE(1.0, "Turning... current: %.2f, target: %.2f, diff: %.2f degrees", 
+                          current_yaw_ * 180.0 / M_PI, turnAroundTargetYaw_ * 180.0 / M_PI, 
+                          yawDiff * 180.0 / M_PI);
     }
 
     void pathCallback(const nav_msgs::Path::ConstPtr& msg)
@@ -101,7 +241,7 @@ private:
         }
         if (!path_points_.empty()) {
             path_received_ = true;
-            reached_goal_ = false; // Reset reached goal when new path arrives
+            reached_goal_ = false;
         }
     }
 
@@ -146,16 +286,13 @@ private:
         double tracking_pos_y = current_position_.y;
         double tracking_yaw = current_yaw_;
 
-        // IF Local Path Logic is enabled:
-        // We act AS IF the vehicle is at (0,0) and facing 0 degrees (East).
-        // The path points are assumed to be relative to the vehicle body.
         if (use_local_path_logic_) {
             tracking_pos_x = 0.0;
             tracking_pos_y = 0.0;
             tracking_yaw = 0.0;
         }
 
-        // 1. Find closest point on path (using the chosen coordinate system)
+        // Find closest point on path
         double min_distance = std::numeric_limits<double>::max();
         size_t closest_index = 0;
         size_t size = path_points_.size();
@@ -220,7 +357,6 @@ private:
             // ROS_INFO_THROTTLE(1.0, "Aligning yaw... error=%.2f", yaw_error_deg);
             return;
         }
-        // ------------------------------------------
 
         // 2. Select lookahead point
         size_t dot_next_index = closest_index + (size_t)lookahead_index_offset_;
@@ -271,7 +407,6 @@ private:
 
         yhs_can_msgs::ctrl_cmd ctrl_cmd_msg;
         ctrl_cmd_msg.ctrl_cmd_gear = 6; 
-        
         ctrl_cmd_msg.ctrl_cmd_x_linear = real_velocity_;
         ctrl_cmd_msg.ctrl_cmd_z_angular = real_steering_; 
 
@@ -283,7 +418,7 @@ private:
         // For simplicity, visualizing in map frame with odom data is better.
         // But if local logic is used, theta_vector is local.
         // Let's visualize based on actual vehicle position in Map always.
-        
+
         double viz_vel_x, viz_vel_y;
         if (use_local_path_logic_) {
             // theta_vector is in body frame (x forward, y left).
