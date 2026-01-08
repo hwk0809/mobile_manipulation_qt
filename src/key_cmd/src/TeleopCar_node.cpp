@@ -182,32 +182,44 @@ namespace yhs
         return_goal_pub_.publish(goal_msg);
     }
 
-    void TeleopCar::switchToArmGrabMode()
-    {
-        // 保持之前修改好的 Trigger 调用
-        // 11111
-        ros::ServiceClient client = nh_.serviceClient<std_srvs::Trigger>("/start_grasp_task");
-        std_srvs::Trigger srv;
+void TeleopCar::switchToArmGrabMode()
+{
+    ros::ServiceClient client = nh_.serviceClient<std_srvs::Trigger>("/start_grasp_task");
+    std_srvs::Trigger srv;
 
-        if (client.call(srv))
+    if (client.call(srv))
+    {
+        if (srv.response.success)
         {
-            if (srv.response.success)
-            {
-                ROS_INFO("Mechanical arm task SUCCESS: %s", srv.response.message.c_str());
-            }
-            else
-            {
-                ROS_WARN("Mechanical arm task REJECTED: %s", srv.response.message.c_str());
-                // 如果被拒绝，可以在这里将 is_grasping_active_ 重置为 false 以便重试
-                is_grasping_active_ = false; 
-                stopCar();
-            }
+            ROS_INFO("Mechanical arm task SUCCESS: %s", srv.response.message.c_str());
+            // 抓取成功,等待机械臂通知返回
         }
         else
         {
-            ROS_ERROR("Failed to call service start_grasp_task.");
-            is_grasping_active_ = false;
+            std::string msg = srv.response.message;
+            
+            // 检查是否是IK失败需要重定位
+            if (msg.find("repositioning requested") != std::string::npos)
+            {
+                ROS_WARN("IK failed, waiting for repositioning...");
+                // 等待机械臂发送新的goal,车辆会自动接收并移动
+                // 移动完成后,会再次触发switchToArmGrabMode
+                is_grasping_active_ = false;  // 解锁,允许重新尝试
+                reached_goal_ = false;  // 重置到达标志
+            }
+            else
+            {
+                ROS_WARN("Mechanical arm task REJECTED: %s", msg.c_str());
+                is_grasping_active_ = false;
+                stopCar();
+            }
         }
+    }
+    else
+    {
+        ROS_ERROR("Failed to call service start_grasp_task.");
+        is_grasping_active_ = false;
+    }
     }
     //3.根据currentpos计算出速度指向，并更新全局变量
     void TeleopCar::updateVelocity(const Eigen::Vector2d position)
